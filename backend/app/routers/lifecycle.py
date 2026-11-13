@@ -1,4 +1,8 @@
-"""表生命周期管理接口：维护生命周期策略，覆盖启用策略、归档表、删除表等动作。"""
+"""表生命周期管理接口：维护生命周期策略，覆盖启用策略、归档表、删除表等动作。
+
+状态机固定为 草稿→生效中→已到期→已归档，接口只做参数编排，
+所有流转/幂等/并发/审计/回收站同步规则都在 ``LifecycleService`` 内。
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -6,14 +10,26 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 
 from app.schemas import ActionResult, EntryPayload, PageResult
-from app.services.lifecycle import LifecycleService
+from app.services.lifecycle import (
+    STATUS_ORDER,
+    TRANSITIONS,
+    LifecycleService,
+)
 
 router = APIRouter(prefix="/api/lifecycle", tags=["表生命周期管理"])
 
 service = LifecycleService()
 
 LIST_FIELDS = ["策略编号", "表名称", "创建日期", "保留天数", "归档路径", "清理方式", "最后操作", "策略状态"]
-STATUSES = ["草稿", "生效中", "已到期", "已归档"]
+STATUSES = STATUS_ORDER
+
+
+def _allowed_action(status: str) -> str | None:
+    """返回某状态下唯一合法的下一步动作，终态或未知状态返回 None。"""
+    for action, (from_status, _target) in TRANSITIONS.items():
+        if from_status == status:
+            return action
+    return None
 
 
 @router.get("", response_model=PageResult[dict])
@@ -27,6 +43,9 @@ def list_entries(
     if size > 200:
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
     items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
+    # 顺带告诉前端每行当前唯一可执行的动作，避免渲染越级/回退按钮。
+    for item in items:
+        item["可执行动作"] = _allowed_action(str(item.get("status") or "")) or ""
     return PageResult(items=items, total=total, page=page, size=size)
 
 
@@ -50,10 +69,11 @@ def create_entry(payload: EntryPayload) -> ActionResult:
 
 @router.post("/{entry_id}/actions", response_model=ActionResult)
 def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
-    """对单条生命周期策略执行启用策略、归档表、删除表；不允许的动作会被拦下并说明原因。"""
+    """对单条生命周期策略执行动作；越级、回退、重放与并发争抢都由服务层统一裁决。"""
     action = str(payload.values.get("action") or "").strip()
     entry, message = service.run_action(entry_id, action)
     if entry is None:
+        # 业务拒绝不是 500：保留 200 + ok=False，前端按 message 给出可读提示。
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
 

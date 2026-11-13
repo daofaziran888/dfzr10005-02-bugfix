@@ -39,14 +39,15 @@
           <td v-for="column in columns" :key="column">{{ row[column] ?? '—' }}</td>
           <td class="row-actions">
             <button
-              v-for="action in actions"
-              :key="action"
+              v-if="row['可执行动作']"
               class="link"
               type="button"
-              @click="runAction(action, row)"
+              :disabled="busyId === String(row.id)"
+              @click="runAction(String(row['可执行动作']), row)"
             >
-              {{ action }}
+              {{ busyId === String(row.id) ? '处理中…' : row['可执行动作'] }}
             </button>
+            <span v-else class="muted-text">已归档（终态）</span>
           </td>
         </tr>
         <tr v-if="!rows.length">
@@ -57,8 +58,25 @@
 
     <footer class="page-foot">
       <span>共 {{ total }} 条表生命周期管理记录</span>
-      <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
+      <span v-if="feedback" :class="feedbackOk ? 'success-text' : 'error-text'">{{ feedback }}</span>
     </footer>
+
+    <div v-if="createOpen" class="modal-overlay" @click.self="closeCreate">
+      <form class="modal-card" @submit.prevent="submitCreate">
+        <h3>登记生命周期策略</h3>
+        <label v-for="field in createFields" :key="field.name" class="modal-field">
+          <span>{{ field.label }}<em v-if="field.required">*</em></span>
+          <input v-model="createForm[field.name]" :placeholder="field.placeholder" />
+        </label>
+        <p v-if="createError" class="error-text">{{ createError }}</p>
+        <div class="modal-actions">
+          <button class="btn ghost" type="button" @click="closeCreate">取消</button>
+          <button class="btn primary" type="submit" :disabled="submitting">
+            {{ submitting ? '提交中…' : '确认登记' }}
+          </button>
+        </div>
+      </form>
+    </div>
   </section>
 </template>
 
@@ -71,15 +89,33 @@ type Row = Record<string, string | number | null>
 
 const ENDPOINT = '/api/lifecycle'
 const columns = ["策略编号", "表名称", "创建日期", "保留天数", "归档路径", "清理方式", "最后操作", "策略状态"]
-const actions = ["启用策略", "归档表", "删除表"]
-const statuses = ["草稿", "生效中", "已到期", "已归档"]
-const stats = [{"label": "生命周期策略总数", "value": 0}, {"label": "生效中策略", "value": 0}, {"label": "已到期策略", "value": 0}]
+const stats = ref([
+  { label: "生命周期策略总数", value: 0 },
+  { label: "生效中策略", value: 0 },
+  { label: "已到期策略", value: 0 },
+])
 
 const rows = ref<Row[]>([])
 const total = ref(0)
-const errorMessage = ref('')
+const feedback = ref('')
+const feedbackOk = ref(false)
+const busyId = ref('')
 const filters = ref<Record<string, string>>({})
 const filterFields = columns.slice(0, 3)
+
+const createFields = [
+  { name: '策略编号', label: '策略编号', required: true, placeholder: '如 LIFE-0004' },
+  { name: '表名称', label: '表名称', required: true, placeholder: '如 ods_order_detail' },
+  { name: '创建日期', label: '创建日期', required: true, placeholder: '如 2026-11-13' },
+  { name: '保留天数', label: '保留天数', required: false, placeholder: '如 90' },
+  { name: '归档路径', label: '归档路径', required: false, placeholder: '如 oss://dw-archive/表名/' },
+  { name: '清理方式', label: '清理方式', required: false, placeholder: '如 先归档后删除' },
+] as const
+
+const createOpen = ref(false)
+const submitting = ref(false)
+const createError = ref('')
+const createForm = ref<Record<string, string>>({})
 
 function resetFilters() {
   filters.value = {}
@@ -91,38 +127,93 @@ function exportRows() {
 }
 
 function openCreate() {
-  errorMessage.value = '生命周期策略登记入口尚未接入审批流'
+  createForm.value = {}
+  createError.value = ''
+  createOpen.value = true
+}
+
+function closeCreate() {
+  if (submitting.value) return
+  createOpen.value = false
+  createError.value = ''
+}
+
+async function submitCreate() {
+  createError.value = ''
+  submitting.value = true
+  try {
+    const response = await request(ENDPOINT, {
+      method: 'POST',
+      body: JSON.stringify({ values: { ...createForm.value } }),
+    })
+    const payload = await response.json()
+    if (!response.ok || !payload.ok) {
+      createError.value = payload.message || '生命周期策略登记失败'
+      return
+    }
+    createOpen.value = false
+    feedback.value = '生命周期策略已登记，初始状态为草稿'
+    feedbackOk.value = true
+    await reload()
+  } catch (error) {
+    createError.value = error instanceof Error ? error.message : '生命周期策略登记失败'
+  } finally {
+    submitting.value = false
+  }
 }
 
 async function runAction(action: string, row: Row) {
-  errorMessage.value = ''
+  feedback.value = ''
+  busyId.value = String(row.id)
   try {
     const response = await request(`${ENDPOINT}/${row.id}/actions`, {
       method: 'POST',
-      body: JSON.stringify({ action }),
+      body: JSON.stringify({ values: { action } }),
     })
-    if (!response.ok) {
-      throw new Error('表生命周期管理动作未生效，请稍后重试')
+    const payload = await response.json()
+    if (!response.ok || !payload.ok) {
+      // 越级/回退/重放/并发争抢的业务裁决结果，原样展示，不残留旧提示。
+      feedback.value = payload.message || '表生命周期管理动作未生效，请稍后重试'
+      feedbackOk.value = false
+    } else {
+      feedback.value = payload.message || '动作已执行'
+      feedbackOk.value = true
     }
     await reload()
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '表生命周期管理操作失败'
+    feedback.value = error instanceof Error ? error.message : '表生命周期管理操作失败'
+    feedbackOk.value = false
+  } finally {
+    busyId.value = ''
   }
 }
 
 async function reload() {
-  errorMessage.value = ''
   const query = new URLSearchParams(filters.value as Record<string, string>).toString()
   try {
-    const response = await request(`${ENDPOINT}?${query}`)
-    if (!response.ok) {
+    const [listResponse, statResponse] = await Promise.all([
+      request(`${ENDPOINT}?${query}`),
+      request(`${ENDPOINT}?page=1&size=10000`),
+    ])
+    if (!listResponse.ok) {
       throw new Error('生命周期策略列表读取失败')
     }
-    const payload = await response.json()
+    const payload = await listResponse.json()
     rows.value = payload.items ?? []
     total.value = payload.total ?? rows.value.length
+
+    if (statResponse.ok) {
+      const statPayload = await statResponse.json()
+      const all: Row[] = statPayload.items ?? []
+      stats.value = [
+        { label: "生命周期策略总数", value: statPayload.total ?? all.length },
+        { label: "生效中策略", value: all.filter((item) => item.status === '生效中').length },
+        { label: "已到期策略", value: all.filter((item) => item.status === '已到期').length },
+      ]
+    }
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '表生命周期管理列表读取失败'
+    feedback.value = error instanceof Error ? error.message : '表生命周期管理列表读取失败'
+    feedbackOk.value = false
   }
 }
 
